@@ -1,0 +1,770 @@
+---
+title: "Cell interaction analysis for mice fibroblasts and dentric cells"
+author: "Jiangyan Yu (jiangyan.yu@uni-bonn.de)"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    code_folding: hide
+    number_sections: yes
+    theme: united
+    toc: yes
+    toc_float: yes
+  pdf_document:
+    toc: yes
+---
+
+```{r global_options}
+knitr::opts_chunk$set(warning=FALSE, messgae=FALSE, fig.path='Figs/', results = "hide",fig.width=8, fig.height=4)
+```
+
+# Libraries
+
+```{r library, include=FALSE, warning=FALSE, message=FALSE}
+rm(list=ls())
+#CRAN packages
+list.of.packages <- c("readr",
+                      "cowplot",
+                      "useful",
+                      "stringr",
+                      "umap",
+                      "ggplot2",
+                      "reshape2",
+                      "dplyr",
+                      "tidyr",
+                      "Matrix.utils",
+                      "VGAM",
+                      "Seurat",
+                      "magrittr",
+                      "RColorBrewer",
+                      "ggpubr",
+                      "tibble"
+)
+
+new.packages <- list.of.packages[!(list.of.packages %in% installed.packages()[,"Package"])]
+if(length(new.packages)>0) install.packages(new.packages)
+
+#BioconductoR packages
+list.of.bioc.packages <- c("tximport",
+                           "DESeq2",
+                           "slingshot",
+                           "flowCore",
+                           "biomaRt",
+                           "clusterProfiler",
+                           "org.Hs.eg.db",
+                           "org.Mm.eg.db",
+                           "GO.db",
+                           "GSEABase",
+                           "nichenetr",
+                           "DOSE",
+                           # "VISION",
+                           "scater",
+                           "CARNIVAL",
+                           "ComplexHeatmap")
+new.packages.bioc <- list.of.bioc.packages[!(list.of.bioc.packages %in% installed.packages()[,"Package"])]
+ 
+if(length(new.packages.bioc)>0)if (!requireNamespace("BiocManager")) install.packages("BiocManager")
+BiocManager::install(new.packages.bioc, update = FALSE)
+
+lapply(c(list.of.packages,list.of.bioc.packages), require, character.only = TRUE)
+
+rm(list.of.packages,new.packages,list.of.bioc.packages,new.packages.bioc)
+```
+
+# working.dir and functions
+
+```{r working directory, message=FALSE, warning=FALSE,results='hide'}
+working.dir = "/home/yu.j/sciebo/Projects/Zhang_DC_project_ownerJY/"
+
+# 
+function_dir = "/home/yu.j/sciebo/general_scripts/Global_ref_data/"
+# published_data_dir = "/home/yu.j/sciebo/general_scripts/publised_datasets/"
+# global_ref_dir = "/home/yu.j/sciebo/general_scripts/Global_ref_data/"
+# gsea_pathway_dir = "/home/yu.j/sciebo/general_scripts/Global_ref_data/"
+# 
+# source(paste0(function_dir,"general_functions.R"))
+```
+
+## nichenetr wrapped function
+
+download needed database from "zenodo.org/record/3260758":
+weighted_networks = readRDS(url("https://zenodo.org/record/3260758/files/weighted_networks.rds"))
+ligand_tf_matrix = readRDS(url("https://zenodo.org/record/3260758/files/ligand_tf_matrix.rds"))
+lr_network = readRDS(url("https://zenodo.org/record/3260758/files/lr_network.rds"))
+sig_network = readRDS(url("https://zenodo.org/record/3260758/files/signaling_network.rds"))
+gr_network = readRDS(url("https://zenodo.org/record/3260758/files/gr_network.rds"))
+
+```{r wrapped nichenetr function, message=FALSE, warning=FALSE,results='hide'}
+Zhang_DC_nichenetr_all_genes = function(seurat.object, receiver.cells, sender.cells,DE_table_receiver, label.receiver.cells, label.sender.cells, top_n_target_per_ligand, geneset_oi_avg_log2FC, best_ligand_top_n){
+  RNA.counts=seurat.object@assays$RNA@counts
+  receiver.cells=receiver.cells
+  sender.cells=sender.cells
+  DE_table_receiver=DE_table_receiver
+  label.receiver.cells=label.receiver.cells
+  label.sender.cells=label.sender.cells
+  top_n_target_per_ligand=top_n_target_per_ligand
+  geneset_oi_avg_log2FC=geneset_oi_avg_log2FC
+  best_ligand_top_n=best_ligand_top_n
+  
+  ### import nichenet database
+  # Nichenetr packages
+  ligand_target_matrix = readRDS(paste(function_dir,"nichenetr_ligand_target_matrix.rds", sep = "/"))
+  
+  ##convert from human to mouse
+  colnames(ligand_target_matrix) = ligand_target_matrix %>% colnames() %>% convert_human_to_mouse_symbols()
+  rownames(ligand_target_matrix) = ligand_target_matrix %>% rownames() %>% convert_human_to_mouse_symbols()
+  ligand_target_matrix = ligand_target_matrix %>% .[!is.na(rownames(ligand_target_matrix)), !is.na(colnames(ligand_target_matrix))]
+  
+  lr_network = readRDS(paste(function_dir,"nichenetr_lr_network.rds",sep = "/"))
+  
+  lr_network$from_mouse <- lr_network$from %>% convert_human_to_mouse_symbols()
+  lr_network$to_mouse <- lr_network$to %>% convert_human_to_mouse_symbols()
+  
+  weighted_networks = readRDS(paste(function_dir,"nichenetr_weighted_networks.rds",sep = "/"))
+  weighted_networks_m = weighted_networks
+  weighted_networks_m$lr_sig = weighted_networks_m$lr_sig %>% mutate(from = convert_human_to_mouse_symbols(from), to = convert_human_to_mouse_symbols(to)) %>% tidyr::drop_na()
+  weighted_networks_m$gr = weighted_networks_m$gr %>% mutate(from = convert_human_to_mouse_symbols(from), to = convert_human_to_mouse_symbols(to)) %>% tidyr::drop_na()
+  
+  weighted_networks_lr = weighted_networks$lr_sig %>% inner_join(lr_network %>% distinct(from,to), by = c("from","to"))
+  
+  weighted_networks_lr = weighted_networks_lr %>% mutate(from_mouse = convert_human_to_mouse_symbols(from), to_mouse = convert_human_to_mouse_symbols(to)) %>% tidyr::drop_na()
+  
+  ligand_tf_matrix = readRDS(paste(function_dir,"nichenetr_ligand_tf_matrix.rds", sep = "/"))
+  colnames(ligand_tf_matrix) = ligand_tf_matrix %>% colnames() %>% convert_human_to_mouse_symbols()
+  rownames(ligand_tf_matrix) = ligand_tf_matrix %>% rownames() %>% convert_human_to_mouse_symbols()
+  ligand_tf_matrix = ligand_tf_matrix %>% .[!is.na(rownames(ligand_tf_matrix)), !is.na(colnames(ligand_tf_matrix))]
+  
+  sig_network = readRDS(paste(function_dir,"nichenetr_signaling_network.rds", sep = "/"))
+  sig_network$from <- sig_network$from %>% convert_human_to_mouse_symbols()
+  sig_network$to <- sig_network$to %>% convert_human_to_mouse_symbols()
+  
+  gr_network = readRDS(paste(function_dir,"nichenetr_gr_network.rds", sep = "/"))
+  gr_network$from <- gr_network$from %>% convert_human_to_mouse_symbols()
+  gr_network$to <- gr_network$to %>% convert_human_to_mouse_symbols()
+  
+  ### define genes of interests
+  expressed_genes_receiver = RNA.counts %>% .[,receiver.cells] %>% apply(1,function(x){sum(x>0)/length(x)}) %>% .[. >=0.1] %>% names()
+  
+  receptors = lr_network %>% pull(to_mouse) %>% unique()
+  expressed_receptors = intersect(receptors, expressed_genes_receiver)
+  
+  background_expressed_genes = expressed_genes_receiver %>% .[. %in% rownames(ligand_target_matrix)]
+  
+  ## define gene of interest
+  # DE_table_receiver = FindMarkers(object = seurat.object, ident.1 = receiver.cells, min.pct = 0.10) %>% rownames_to_column("gene")
+  
+  geneset_oi = DE_table_receiver %>% dplyr::filter(p_val_adj <= 0.05 & avg_log2FC >= geneset_oi_avg_log2FC) %>% pull(gene) %>% .[. %in% rownames(ligand_target_matrix)] %>% as.character()
+  
+  ligands = lr_network %>% pull(from_mouse) %>% unique()
+  
+  sender_genes_sender = RNA.counts %>% .[,sender.cells] %>% apply(1,function(x){sum(x>0)/length(x)}) %>% .[. >=0.1] %>% names()
+  expressed_ligands_sender = intersect(ligands,sender_genes_sender)
+  expressed_ligands = expressed_ligands_sender
+  
+  potential_ligands = lr_network %>% dplyr::filter(from_mouse %in% expressed_ligands & to_mouse %in% expressed_receptors) %>% pull(from_mouse) %>% unique()
+  
+  ligand_activities = predict_ligand_activities(
+    geneset = geneset_oi, 
+    background_expressed_genes = background_expressed_genes, 
+    ligand_target_matrix = ligand_target_matrix, 
+    potential_ligands = potential_ligands)
+  
+  ligand_activities %>% arrange(-pearson) %>% mutate(rank = rank(plyr::desc(pearson)))
+  ligand_activities
+  
+  best_upstream_ligands = ligand_activities %>% 
+    top_n(best_ligand_top_n, pearson) %>%
+    arrange(-pearson) %>% 
+    pull(test_ligand) %>%
+    unique()
+  
+  # DotPlot(seurat.object, features = best_upstream_ligands %>% rev(), cols = "Blue", split.by = "celltype") + RotatedAxis()
+  
+  # show histogram of ligand activity scores
+  ## define cut-off for the number of selected ligands
+  p_hist_lig_activity = ggplot(ligand_activities, aes(x=pearson)) + 
+    geom_histogram(color="black", fill="darkorange")  + 
+    # geom_density(alpha=.1, fill="orange") +
+    geom_vline(aes(xintercept=min(ligand_activities %>% top_n(20, pearson) %>% pull(pearson))), color="red", linetype="dashed", size=1) + 
+    labs(x="ligand activity (PCC)", y = "# ligands") +
+    theme_classic()
+  
+  active_ligand_target_links_df = best_upstream_ligands %>% 
+    lapply(get_weighted_ligand_target_links,geneset = geneset_oi, ligand_target_matrix = ligand_target_matrix, n = top_n_target_per_ligand) %>% 
+    bind_rows() %>% drop_na()
+  
+  ### for visualisation
+  active_ligand_target_links = prepare_ligand_target_visualization(ligand_target_df = active_ligand_target_links_df, ligand_target_matrix = ligand_target_matrix, cutoff = 0.1) ## old cutoff was 0.25, new is 0.33
+  
+  order_ligands = intersect(best_upstream_ligands, colnames(active_ligand_target_links)) %>% 
+    rev() %>% make.names()
+  order_targets = active_ligand_target_links_df$target %>% 
+    unique() %>% 
+    intersect(rownames(active_ligand_target_links)) %>% 
+    make.names()
+  rownames(active_ligand_target_links) = rownames(active_ligand_target_links) %>% make.names() # make.names() for heatmap visualization of genes like H2-T23
+  colnames(active_ligand_target_links) = colnames(active_ligand_target_links) %>% make.names() # make.names() for heatmap visualization of genes like H2-T23
+  
+  vis_ligand_target = active_ligand_target_links[order_targets,order_ligands] %>% 
+    t()
+  
+  p_ligand_target_network = vis_ligand_target %>% make_heatmap_ggplot(paste("Prioritized",label.sender.cells, "ligands"), paste("DE genes in", label.receiver.cells, "cells"), color = "purple",legend_position = "top", x_axis_position = "top",legend_title = "Regulatory potential") + scale_fill_gradient2(low = "whitesmoke",  high = "purple", breaks = c(0,0.005,0.01)) + theme(axis.text.x = element_text(face = "italic"))
+  
+  lr_network_top = lr_network %>% 
+    dplyr::filter(from_mouse %in% best_upstream_ligands & to_mouse %in% expressed_receptors) %>% 
+    distinct(from_mouse,to_mouse)
+  
+  best_upstream_receptors = lr_network_top %>% pull(to_mouse) %>% unique()
+  
+  lr_network_top_df_large = weighted_networks_lr %>% 
+    dplyr::filter(from_mouse %in% best_upstream_ligands & to_mouse %in% best_upstream_receptors)
+  
+  lr_network_top_df = lr_network_top_df_large %>% tidyr::spread("from_mouse","weight",fill = 0)
+  ###remove from and to columns due to mouse orgnism
+  lr_network_top_df = lr_network_top_df[,c(-1,-2)]
+  lr_network_top_matrix = lr_network_top_df %>% dplyr::select(-to_mouse) %>% as.matrix() %>% magrittr::set_rownames(lr_network_top_df$to_mouse)
+  
+  # perform hierarchical clustering to order the ligands and receptors
+  dist_receptors = dist(lr_network_top_matrix, method = "binary")
+  hclust_receptors = hclust(dist_receptors, method = "ward.D2")
+  order_receptors = hclust_receptors$labels[hclust_receptors$order]
+  
+  dist_ligands = dist(lr_network_top_matrix %>% t(), method = "binary")
+  dist_ligands[is.na(dist_ligands)] = 0
+  hclust_ligands = hclust(dist_ligands, method = "ward.D2")
+  order_ligands_receptor = hclust_ligands$labels[hclust_ligands$order]
+  
+  order_receptors = order_receptors %>% intersect(rownames(lr_network_top_matrix))
+  order_ligands_receptor = order_ligands_receptor %>% intersect(colnames(lr_network_top_matrix))
+  
+  vis_ligand_receptor_network = lr_network_top_matrix[order_receptors, order_ligands_receptor]
+  rownames(vis_ligand_receptor_network) = order_receptors %>% make.names()
+  colnames(vis_ligand_receptor_network) = order_ligands_receptor %>% make.names()
+  
+  p_ligand_receptor_network = vis_ligand_receptor_network %>% t() %>% make_heatmap_ggplot("Ligands","Receptors", color = "mediumvioletred", x_axis_position = "top",legend_title = "Prior interaction potential")
+  
+  print("Please mannually check the ligand_activities matrix to explore which ligands are biologically meaningful. Then set best_ligand_top_n accordingly.")
+  
+  return(list(p_hist_lig_activity=p_hist_lig_activity,
+              p_ligand_target_network=p_ligand_target_network,
+              p_ligand_receptor_network=p_ligand_receptor_network,
+              order_receptors= order_receptors,
+              order_ligands_receptor=order_ligands_receptor,
+              ligand_activities = ligand_activities,
+              active_ligand_target_links_df = active_ligand_target_links_df,
+              lr_network_top_df_large = lr_network_top_df_large %>% rename(ligand = from_mouse, receptor = to_mouse)))  
+}
+```
+
+# Tsukui dataset
+
+data were downloaded from https://www.nature.com/articles/s41467-020-15647-5
+following two samples are used: GSM3891616_UT1_GFPp, GSM3891617_UT2_GFPp, GSM3891618_UT1_GFPn, GSM3891619_UT2_GFPn
+
+## untreated sample (both GFP+ and GFP-)
+
+```{r seurat step1}
+# tsukui_mouse_data_dir = "/home/yu.j/sciebo/publised_datasets/GSE132771/Mouse"
+# # tsukui_mouse_data_dir = "/Users/jiangyanyu/sciebo/publised_datasets/GSE132771/Mouse"
+# tsukui_mouse_ids = list.files(tsukui_mouse_data_dir) # Should show barcodes.tsv, genes.tsv, and matrix.mtx
+# tsukui_mouse_ids_ut = tsukui_mouse_ids[c(5:8)]
+# 
+# tsukui_d10x.data_ut <- sapply(tsukui_mouse_ids_ut, function(i){
+#   mat <- readMM(paste(paste(tsukui_mouse_data_dir,i, sep="/"),paste(i,"matrix.mtx.gz",sep="_"),sep="/"))
+#   
+#   gene.names = read.delim(paste(paste(tsukui_mouse_data_dir,i, sep="/"),paste(i,"genes.tsv.gz",sep="_"),sep="/"), 
+#                            header = FALSE,stringsAsFactors = FALSE)
+#   
+#   barcode.names = read.delim(paste(paste(tsukui_mouse_data_dir,i, sep="/"),paste(i,"barcodes.tsv.gz",sep="_"),sep="/"), 
+#                            header = FALSE,stringsAsFactors = FALSE)
+#   colnames(mat) = paste(i,barcode.names$V1,sep="_")
+#   rownames(mat) = gene.names$V2
+#   mat
+# })
+# 
+# 
+# tsukui_experiment.data_ut <- do.call("cbind", tsukui_d10x.data_ut)
+# 
+# tsukui_meta_ut = colnames(tsukui_experiment.data_ut) %>% as.data.frame()
+# rownames(tsukui_meta_ut) = tsukui_meta_ut$.
+# tsukui_meta_ut$seq = sapply(strsplit(colnames(tsukui_experiment.data_ut),split="_"),'[[',c(1L))
+# tsukui_meta_ut$sample = sapply(strsplit(colnames(tsukui_experiment.data_ut),split="_"),'[[',c(2L))
+# tsukui_meta_ut$GFP = sapply(strsplit(colnames(tsukui_experiment.data_ut),split="_"),'[[',c(3L))
+# tsukui_meta_ut = tsukui_meta_ut[,c("seq","sample","GFP")]
+# 
+# tsukui_mouse_seurat_ut <- CreateSeuratObject(
+#   tsukui_experiment.data_ut,
+#   project = "tsukui_mouse_ut", 
+#   meta.data = tsukui_meta_ut,
+#   min.cells = 10)
+#   # min.genes = 200,
+#   # names.field = 2,
+#   # names.delim = "\\-")
+# 
+# rm(tsukui_mouse_data_dir,tsukui_mouse_ids_ut,tsukui_d10x.data_ut)
+
+# tsukui_mouse_seurat_ut[["percent.mt"]] <- PercentageFeatureSet(tsukui_mouse_seurat_ut, pattern = "^mt-")
+# 
+# VlnPlot(tsukui_mouse_seurat_ut, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+# 
+# FeatureScatter(tsukui_mouse_seurat_ut,feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+# 
+# tsukui_mouse_seurat_ut <- subset(tsukui_mouse_seurat_ut, subset = nCount_RNA > 250 & percent.mt < 10)
+# 
+# tsukui_mouse_seurat_ut = tsukui_mouse_seurat_ut %>% NormalizeData(., normalization.method = "LogNormalize", scale.factor = 10000) %>% FindVariableFeatures(., selection.method = "vst", nfeatures = 2000) %>% ScaleData(., features = rownames(.)) %>% RunPCA(.,features = VariableFeatures(.), verbose = FALSE) %>% JackStraw(., num.replicate = 100) %>% ScoreJackStraw(., dims = 1:20)
+# 
+# JackStrawPlot(tsukui_mouse_seurat_ut, dims = 1:20)
+# ElbowPlot(tsukui_mouse_seurat_ut)
+# 
+# tsukui_mouse_seurat_ut = FindNeighbors(tsukui_mouse_seurat_ut, dims = 1:20)
+#   
+# tsukui_mouse_seurat_ut = tsukui_mouse_seurat_ut %>% FindClusters(., resolution = 0.6) %>% RunUMAP(., dims=1:20)
+# #tsukui_mouse_seurat_ut_allmarkers = FindAllMarkers(tsukui_mouse_seurat_ut)
+# 
+# DimPlot(tsukui_mouse_seurat_ut,reduction = "umap",label = TRUE)
+# DimPlot(tsukui_mouse_seurat_ut,group.by = "GFP")
+# FeaturePlot(tsukui_mouse_seurat_ut,features = "Col1a1")
+
+# saveRDS(tsukui_mouse_seurat_ut,file = paste0(working.dir,"tsukui_mouse_seurat_ut_20200721.rds"))
+```
+
+## untreated samples GFP+ cells
+
+```{r seurat step2}
+# set.seed(1234)
+# tsukui_mouse_seurat_ut_GFPp_col1a1 = WhichCells(subset(tsukui_mouse_seurat_ut, subset = GFP == "GFPp"), expression = Col1a1 > 2,slot = "data")
+# 
+# DimPlot(tsukui_mouse_seurat_ut, cells.highlight = tsukui_mouse_seurat_ut_GFPp_col1a1)
+# 
+# tsukui_mouse_GFPp_col1a1_seurat_ut = CreateSeuratObject(counts = tsukui_experiment.data_ut %>% .[,colnames(.) %in% tsukui_mouse_seurat_ut_GFPp_col1a1], meta.data = tsukui_meta_ut,project = "tsukui_mouse_GFPp_col1a1_ut")
+# 
+# tsukui_mouse_GFPp_col1a1_seurat_ut[["percent.mt"]] <- PercentageFeatureSet(tsukui_mouse_GFPp_col1a1_seurat_ut, pattern = "^mt-")
+# 
+# VlnPlot(tsukui_mouse_GFPp_col1a1_seurat_ut, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+# 
+# FeatureScatter(tsukui_mouse_GFPp_col1a1_seurat_ut,feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+# 
+# tsukui_mouse_GFPp_col1a1_seurat_ut <- subset(tsukui_mouse_GFPp_col1a1_seurat_ut, subset = nCount_RNA > 250 & percent.mt < 10)
+# 
+# tsukui_mouse_GFPp_col1a1_seurat_ut = tsukui_mouse_GFPp_col1a1_seurat_ut %>% NormalizeData(., normalization.method = "LogNormalize", scale.factor = 10000) %>% FindVariableFeatures(., selection.method = "vst", nfeatures = 2000) %>% ScaleData(., features = rownames(.)) %>% RunPCA(.,features = VariableFeatures(.), verbose = FALSE) %>% JackStraw(., num.replicate = 100) %>% ScoreJackStraw(., dims = 1:20)
+# 
+# JackStrawPlot(tsukui_mouse_GFPp_col1a1_seurat_ut, dims = 1:20)
+# ElbowPlot(tsukui_mouse_GFPp_col1a1_seurat_ut)
+# 
+# tsukui_mouse_GFPp_col1a1_seurat_ut = FindNeighbors(tsukui_mouse_GFPp_col1a1_seurat_ut, dims = 1:20)
+#   
+# tsukui_mouse_GFPp_col1a1_seurat_ut = tsukui_mouse_GFPp_col1a1_seurat_ut %>% FindClusters(., resolution = 0.5) %>% RunUMAP(., dims=1:20)
+# 
+# 
+# 
+# DimPlot(tsukui_mouse_GFPp_col1a1_seurat_ut,reduction = "umap",label = TRUE)
+# DimPlot(tsukui_mouse_GFPp_col1a1_seurat_ut,split.by = "sample")
+# 
+# saveRDS(tsukui_mouse_GFPp_col1a1_seurat_ut,file = paste0(working.dir,"tsukui_mouse_GFPp_col1a1_seurat_ut_20210520.rds"))
+```
+
+# load saved seurat rds file
+
+```{r seurat step3, message=FALSE, warning=FALSE,results='hide'}
+tsukui_mouse_seurat_ut = readRDS(file = paste0(working.dir,"tsukui_mouse_seurat_ut_20200721.rds"))
+tsukui_mouse_GFPp_col1a1_seurat_ut = readRDS(file = paste0(working.dir,"tsukui_mouse_GFPp_col1a1_seurat_ut_20210520.rds"))
+```
+
+# nichenetr analysis
+
+## add cell type information in seurat object
+
+Gpr183+Mgl2+cDC2
+different types of fibroblasts
+
+```{r add metadata, message=FALSE, warning=FALSE,results='hide'}
+clus15_mgl2_gpr183 = intersect(subset(tsukui_mouse_seurat_ut, idents = 15) %>% WhichCells(., expression = Mgl2 > 0, slot = "data"), subset(tsukui_mouse_seurat_ut, idents = 15) %>% WhichCells(., expression = Gpr183 > 0, slot = "data")) %>% as.data.frame()
+
+colnames(clus15_mgl2_gpr183) = "cell"
+clus15_mgl2_gpr183$type = "Gpr183pMgl2pcDC2"
+rownames(clus15_mgl2_gpr183) = clus15_mgl2_gpr183$cell
+
+
+fibroblasts = tsukui_mouse_GFPp_col1a1_seurat_ut@meta.data 
+fibroblasts$cell = rownames(fibroblasts)
+fibroblasts$type = paste0("Fibroblast_",fibroblasts$seurat_clusters)
+
+append_meta = rbind(clus15_mgl2_gpr183,fibroblasts[,c("cell","type")])
+
+append_meta1 = tsukui_mouse_seurat_ut@meta.data
+append_meta1$order = c(1:nrow(append_meta1))
+append_meta1$cell = rownames(append_meta1)
+
+append_meta2 = merge(append_meta1, append_meta,by="cell",all=TRUE)
+
+append_meta2$typeJY = ifelse(is.na(append_meta2$type),
+                             paste0("steady_",append_meta2$seurat_clusters),
+                             append_meta2$type)
+rownames(append_meta2) = append_meta2$cell
+
+nichenet_seurat = AddMetaData(object = tsukui_mouse_seurat_ut,
+                              metadata = append_meta2$typeJY,
+                              col.name = "typeJY")
+## set cell idents
+nichenet_seurat = SetIdent(nichenet_seurat,value = "typeJY")
+nichenet_seurat@meta.data$condition = "untreated"
+
+rm(clus15_mgl2_gpr183,fibroblasts,append_meta,append_meta1, append_meta2)
+```
+
+## define senders and receivers
+
+```{r define senders and receivers, message=FALSE, warning=FALSE}
+Tsukui.sender.cells = WhichCells(nichenet_seurat, idents = c("Fibroblast_4","Fibroblast_5","Fibroblast_3"))
+label.Tsukui.sender.cells = "Adventitial fibroblasts"
+
+Tsukui.receiver.cells = WhichCells(nichenet_seurat, idents = c("Gpr183pMgl2pcDC2"))
+## DEGs for Gpr183+Mgl2+cDC2 vs all other cells
+Tsukui.DE_table_receiver = FindMarkers(object = nichenet_seurat, ident.1 = Tsukui.receiver.cells, min.pct = 0.10) %>% rownames_to_column("gene")
+label.Tsukui.receiver.cells = "Steady cluster 15 Gpr183+Mgl2+ cDC2"
+
+Tsukui.fibro4_Gpr183cDC2_all = Zhang_DC_nichenetr_all_genes(nichenet_seurat, Tsukui.receiver.cells, Tsukui.sender.cells, Tsukui.DE_table_receiver, label.Tsukui.receiver.cells, label.Tsukui.sender.cells,top_n_target_per_ligand = 100, geneset_oi_avg_log2FC=1, best_ligand_top_n=30)
+
+Tsukui.fibro4_Gpr183cDC2_all$p_ligand_receptor_network
+Tsukui.fibro4_Gpr183cDC2_all$p_ligand_target_network
+```
+
+## Calculate average ligand expression in sender cells
+
+```{r avg ligand expression, message=FALSE, warning=FALSE,results='hide'}
+# Calculate average ligand expression in sender cells 
+top_ligands = Tsukui.fibro4_Gpr183cDC2_all$ligand_activities %>% 
+    top_n(30, pearson) %>%
+    arrange(-pearson) %>% 
+    pull(test_ligand) %>%
+    unique()
+
+## subset seurat to focus on sender and receiver cells
+nichenet_seurat_small = subset(nichenet_seurat,idents=c("Fibroblast_4","Fibroblast_5","Fibroblast_3","Gpr183pMgl2pcDC2"))
+
+# Assign ligands to sender cells
+sender_ligand_assignment = AverageExpression(nichenet_seurat_small, features = top_ligands) %>% .$RNA %>% apply(1, function(ligand_expression){
+  ligand_expression > (ligand_expression %>% mean() + ligand_expression %>% sd())
+  }) %>% t() %>% apply(2, function(x){x[x == TRUE]}) %>% purrr::keep(function(x){length(x) > 0})
+
+names(sender_ligand_assignment)
+
+rm(nichenet_seurat_small)
+```
+
+## define sender specific ligands
+
+```{r sender specific liands, message=FALSE, warning=FALSE,results='hide'}
+specific_ligands = list()
+
+## define general ligands
+specific_ligands$general_ligands = setdiff(top_ligands,sender_ligand_assignment %>% lapply(function(x){names(x)}) %>% unlist() %>% table() %>% .[. == 1] %>% names())
+
+## define cell type specific ligands
+specific_ligands$cell1_specific_ligands = sender_ligand_assignment$Fibroblast_4 %>% names() %>% setdiff(specific_ligands$general_ligands)
+specific_ligands$cell2_specific_ligands = sender_ligand_assignment$Fibroblast_5 %>% names() %>% setdiff(specific_ligands$general_ligands)
+specific_ligands$cell3_specific_ligands = sender_ligand_assignment$Fibroblast_3 %>% names() %>% setdiff(specific_ligands$general_ligands)
+# specific_ligands$cell4_specific_ligands = sender_ligand_assignment$Fibroblast_2 %>% names() %>% setdiff(specific_ligands$general_ligands)
+# specific_ligands$cell5_specific_ligands = sender_ligand_assignment$Fibroblast_0 %>% names() %>% setdiff(specific_ligands$general_ligands)
+# specific_ligands$cell6_specific_ligands = sender_ligand_assignment$Fibroblast_1 %>% names() %>% setdiff(specific_ligands$general_ligands)
+
+
+ligand_type_indication_df = tibble(
+  ligand_type = c(rep("Fibroblast_4-specific", times = specific_ligands$cell1_specific_ligands %>% length()),
+                  rep("Fibroblast_5-specific", times = specific_ligands$cell2_specific_ligands %>% length()),
+                  rep("Fibroblast_3-specific", times = specific_ligands$cell3_specific_ligands %>% length()),
+                  # rep("Fibroblast_2-specific", times = specific_ligands$cell4_specific_ligands %>% length()),
+                  # rep("Fibroblast_0-specific", times = specific_ligands$cell5_specific_ligands %>% length()),
+                  # rep("Fibroblast_1-specific", times = specific_ligands$cell6_specific_ligands %>% length()),
+                  rep("General", times = specific_ligands$general_ligands %>% length())),
+  ligand = c(specific_ligands$cell1_specific_ligands, 
+             specific_ligands$cell2_specific_ligands, 
+             specific_ligands$cell3_specific_ligands,
+             # specific_ligands$cell4_specific_ligands, 
+             # specific_ligands$cell5_specific_ligands,
+             # specific_ligands$cell6_specific_ligands, 
+             specific_ligands$general_ligands))
+
+rm(sender_ligand_assignment, top_ligands)
+```
+
+## Define the ligand-target links of interest
+
+becareful about the ligand name throughout the whole circos script which was based on the nichnetr vignitte, where they add a space at the end of each ligand name.
+
+```{r ligand target links, message=FALSE, warning=FALSE,results='hide'}
+circos_setup = list()
+modifed_df = Tsukui.fibro4_Gpr183cDC2_all$lr_network_top_df_large 
+colnames(modifed_df)[5] = "target"
+
+active_ligand_target_links_df = modifed_df %>% mutate(target_type = "cDC2-DEGs") %>% inner_join(ligand_type_indication_df) # if you want ot make circos plots for multiple gene sets, combine the different data frames and differentiate which receptor belongs to which gene set via the receptor type
+
+cutoff_include_all_ligands = active_ligand_target_links_df$weight %>% quantile(0.40)
+
+active_ligand_target_links_df_circos = active_ligand_target_links_df %>% filter(weight > cutoff_include_all_ligands)
+
+ligands_to_remove = setdiff(active_ligand_target_links_df$ligand %>% unique(), active_ligand_target_links_df_circos$ligand %>% unique())
+targets_to_remove = setdiff(active_ligand_target_links_df$target %>% unique(), active_ligand_target_links_df_circos$target %>% unique())
+  
+circos_setup$circos_links_tmp = active_ligand_target_links_df %>% filter(!target %in% targets_to_remove &!ligand %in% ligands_to_remove)
+
+rm(active_ligand_target_links_df,active_ligand_target_links_df_circos,ligands_to_remove,targets_to_remove)
+```
+
+### prepare the circos visualization
+
+```{r prepare circos1, message=FALSE, warning=FALSE,results='hide'}
+grid_col_ligand =c("General" = "grey",
+                   "Fibroblast_4-specific" = "royalblue",
+                   "Fibroblast_5-specific" = "darkgreen",
+                   "Fibroblast_3-specific" = "violet")
+                   # "Fibroblast_2-specific" = "steelblue2",
+                   # "Fibroblast_0-specific" = "lawngreen",
+                   # "Fibroblast_1-specific" = "red")
+grid_col_target =c("cDC2-DEGs" = "tomato")
+
+def_circos_grid_col = function(circos_links,grid_col_ligand,grid_col_target) {
+  grid_col_tbl_ligand = tibble(ligand_type = grid_col_ligand %>% names(), color_ligand_type = grid_col_ligand)
+  grid_col_tbl_target = tibble(target_type = grid_col_target %>% names(), color_target_type = grid_col_target)
+  # extra space: make a difference between a gene as ligand and a gene as target!
+  circos_links = circos_links %>% mutate(ligand = paste0(ligand," "))
+  circos_links = circos_links %>% inner_join(grid_col_tbl_ligand) %>% inner_join(grid_col_tbl_target)
+  links_circle = circos_links %>% dplyr::select(ligand,target, weight)
+  ligand_color = circos_links %>% distinct(ligand,color_ligand_type)
+  grid_ligand_color = ligand_color$color_ligand_type %>% set_names(ligand_color$ligand)
+  target_color = circos_links %>% distinct(target,color_target_type)
+  grid_target_color = target_color$color_target_type %>% set_names(target_color$target)
+
+  grid_col =c(grid_ligand_color,grid_target_color)
+  return(list(grid_col = grid_col,
+              circos_links = circos_links,
+              links_circle = links_circle))
+}
+
+circos_setup$grid_col = def_circos_grid_col(circos_links = circos_setup$circos_links_tmp,
+                                                    grid_col_ligand = grid_col_ligand,
+                                                    grid_col_target = grid_col_target)
+
+# give the option that links in the circos plot will be transparant ~ ligand-target potential score
+circos_setup$transparency =  circos_setup$grid_col$circos_links %>% mutate(weight =(weight-min(weight))/(max(weight)-min(weight))) %>% mutate(transparency = 1-weight) %>% .$transparency
+```
+
+### order ligands
+
+```{r prepare circos2, message=FALSE, warning=FALSE,results='hide'}
+target_order = circos_setup$grid_col$circos_links$target %>% unique()
+ligand_order = c(specific_ligands$cell1_specific_ligands, 
+                 specific_ligands$cell2_specific_ligands,
+                 specific_ligands$cell3_specific_ligands,
+                 # specific_ligands$cell4_specific_ligands,
+                 # specific_ligands$cell5_specific_ligands,
+                 # specific_ligands$cell6_specific_ligands,
+                 specific_ligands$general_ligands) %>% paste0(.," ") %>% intersect(circos_setup$grid_col$circos_links$ligand)
+circos_setup$order = c(ligand_order,target_order)
+rm(target_order,ligand_order)
+```
+
+### define gaps
+
+```{r prepare circos3, message=FALSE, warning=FALSE,results='hide'}
+width_same_cell_same_ligand_type = 0.5
+width_different_cell = 6
+width_ligand_target = 15
+width_same_cell_same_target_type = 0.5
+
+circos_setup$gaps = c(
+  # width_ligand_target,
+  rep(width_same_cell_same_ligand_type, times = (circos_setup$grid_col$circos_links %>% filter(ligand_type == "Fibroblast_4-specific") %>% distinct(ligand) %>% nrow() -1)),
+  width_different_cell,
+  rep(width_same_cell_same_ligand_type, times = (circos_setup$grid_col$circos_links %>% filter(ligand_type == "Fibroblast_5-specific") %>% distinct(ligand) %>% nrow() -1)),
+  width_different_cell,
+  rep(width_same_cell_same_ligand_type, times = (circos_setup$grid_col$circos_links %>% filter(ligand_type == "Fibroblast_3-specific") %>% distinct(ligand) %>% nrow() -1)),
+  width_different_cell,
+  # rep(width_same_cell_same_ligand_type, times = (circos_setup$grid_col$circos_links %>% filter(ligand_type == "Fibroblast_2-specific") %>% distinct(ligand) %>% nrow() -1)),
+  # width_different_cell,
+  # rep(width_same_cell_same_ligand_type, times = (circos_setup$grid_col$circos_links %>% filter(ligand_type == "Fibroblast_0-specific") %>% distinct(ligand) %>% nrow() -1)),
+  # width_different_cell,
+  # rep(width_same_cell_same_ligand_type, times = (circos_setup$grid_col$circos_links %>% filter(ligand_type == "Fibroblast_1-specific") %>% distinct(ligand) %>% nrow() -1)),
+  # width_different_cell,
+  rep(width_same_cell_same_ligand_type, times = (circos_setup$grid_col$circos_links %>% filter(ligand_type == "General") %>% distinct(ligand) %>% nrow() -1)),
+  width_ligand_target,
+  rep(width_same_cell_same_target_type, times = (circos_setup$grid_col$circos_links %>% filter(target_type == "cDC2-DEGs") %>% distinct(target) %>% nrow() -1)),
+  width_ligand_target
+  )
+
+rm(width_same_cell_same_ligand_type, width_different_cell,width_ligand_target, width_same_cell_same_target_type)
+```
+
+### circos color (for barplot)
+
+take the normalized counts, instead of the scaled data which generates negative values
+
+```{r prepare circos4, message=FALSE, warning=FALSE,results='hide'}
+target_cell_gene = list()
+gene_color = data.frame()
+
+for (type in c("Fibroblast_4-specific","Fibroblast_5-specific","Fibroblast_3-specific","General","cDC2-DEGs")){
+  
+  if(type == "cDC2-DEGs") {
+    target_gene = circos_setup$grid_col$circos_links$target %>% unique() %>% gsub(" ", "", ., fixed = TRUE)
+    target_color = circos_setup$grid_col$circos_links$color_target_type[1]
+  } else {
+    target_gene = subset(circos_setup$grid_col$circos_links,ligand_type == type)
+    target_color = target_gene$color_ligand_type[1]
+    target_gene = target_gene$ligand %>% unique() %>% gsub(" ", "", ., fixed = TRUE)
+  }
+  
+  
+  if(type == "General"){
+    target_cell = subset(nichenet_seurat,idents = c("Fibroblast_4","Fibroblast_5","Fibroblast_3"))
+  } else if ( type == "cDC2-DEGs"){
+    target_cell = subset(nichenet_seurat,idents = c("Gpr183pMgl2pcDC2"))
+  }else {
+    target_cell = subset(nichenet_seurat,idents = strsplit(type,split = "-")[[1]][1])
+  }
+  
+  target_cell_gene[[type]] = target_cell@assays$RNA@data %>% as.data.frame() %>% .[target_gene,]
+  
+  gene_mean = rowMeans(target_cell_gene[[type]]) %>% as.data.frame()
+  gene_mean$type = type
+  
+  # ## correct ligand name accordingly
+  gene_mean$ligand_name = ifelse(gene_mean$type != "cDC2-DEGs", paste0(rownames(gene_mean)," "), rownames(gene_mean))
+
+  gene_color = rbind(gene_color,gene_mean)
+}
+
+### to prepare the input for vlnplot in circos plot
+### combine genes (with different rows)
+
+gene_color_vln = gdata::cbindX(target_cell_gene$`Fibroblast_4-specific`  %>% as.data.frame() %>% t() %>% as.data.frame(),
+                       target_cell_gene$`Fibroblast_3-specific` %>% as.data.frame() %>% t() %>% as.data.frame(),
+                       target_cell_gene$`Fibroblast_5-specific` %>% as.data.frame() %>% t()%>% as.data.frame(),
+                       target_cell_gene$General %>% as.data.frame() %>% t()%>% as.data.frame())
+# ## correct ligand name accordingly
+colnames(gene_color_vln) = paste0(colnames(gene_color_vln)," ")
+
+gene_color_vln = gdata::cbindX(gene_color_vln,
+                               target_cell_gene$`cDC2-DEGs` %>% as.data.frame() %>% t() %>% as.data.frame())
+
+
+
+
+rm(type, target_gene, target_color, target_cell, gene_mean)
+```
+
+
+### plot circos (barplot for gene expression)
+
+```{r circos plot, message=FALSE, warning=FALSE,results='hide'}
+library(circlize)
+
+# pdf(file = paste0(working.dir,"MS_figures/Fig_JYu_10_ligand_receptor_circos_asc_cdc2.pdf"),width = 15,height = 15)
+
+### it is important to set the canvas.xlim and canvas.ylim, otherwise some annotation wont be seen in the figure.
+
+circos.par(gap.degree = circos_setup$gaps,track.margin=c(0,0),canvas.xlim=c(-1.5,1.5),canvas.ylim=c(-1.5,1.5))
+chordDiagram(circos_setup$grid_col$links_circle, 
+             directional = 1,
+             order=circos_setup$order,
+             link.sort = TRUE, 
+             link.decreasing = FALSE, 
+             grid.col = circos_setup$grid_col$grid_col,
+             # col = circos_setup$grid_col$grid_col,
+             transparency = 0, 
+             diffHeight = 0.005, 
+             direction.type = c("diffHeight", "arrows"),
+             link.arr.type = "big.arrow", 
+             link.visible = circos_setup$grid_col$links_circle$weight >= cutoff_include_all_ligands,
+             annotationTrack = "grid",
+             preAllocateTracks = list(track.height = 0.075))
+
+## add extra information and annotation to the outer track 
+circos.track(track.index = 1,
+             ylim = c(-1, 1),
+             bg.border = NA,
+             panel.fun = function(x, y) {
+               value = subset(gene_color, ligand_name == CELL_META$sector.index)
+               
+               ## add barplot for gene expression
+               circos.barplot(value = value[,1], pos = CELL_META$xcenter, col = "grey")
+               
+               ## add gene name
+               circos.text(x=CELL_META$xcenter,y=CELL_META$ylim[1]+5,labels=CELL_META$sector.index,facing = "clockwise",niceFacing = TRUE, adj = c(0, 0.4), cex = 1)
+  }
+)
+
+circos.clear()
+
+# dev.off()
+```
+
+# plot figures for ms
+
+### overall UMAP 
+
+```{r plot figures for ms1}
+# pdf(file = paste0(working.dir,"MS_figures/Fig_JYu_1.UMAP_cluster_overview.pdf"))
+
+DimPlot(tsukui_mouse_seurat_ut,label = TRUE)
+# DimPlot(tsukui_mouse_seurat_ut,label = TRUE, cols = c(rep("grey",15),"tomato",rep("grey",6)))
+
+# dev.off()
+
+```
+
+### define Mgl2+Gpr183+cDC2 cells
+
+gene Mgl2: CD301b (antibody)
+
+```{r plot figures for ms2}
+# pdf(file = paste0(working.dir,"MS_figures/Fig_JYu_2_to_define_cDC2_cells.pdf"))
+FeaturePlot(tsukui_mouse_seurat_ut,features = c("Mgl2"),
+            label = FALSE,
+            slot = "data",
+            cols = c("grey","red"))
+
+FeaturePlot(tsukui_mouse_seurat_ut,features = c("Gpr183"),
+            label = FALSE,
+            slot = "data",
+            cols = c("grey","red"))
+# dev.off()
+
+# pdf(file = paste0(working.dir,"MS_figures/Fig_JYu_3_Mgl2p_Gpr183p_cDC2_cells.pdf"))
+
+clus15_mgl2_gpr183 = intersect(subset(tsukui_mouse_seurat_ut, idents = 15) %>% WhichCells(., expression = Mgl2 > 0, slot = "data"), subset(tsukui_mouse_seurat_ut, idents = 15) %>% WhichCells(., expression = Gpr183 > 0, slot = "data"))
+
+DimPlot(tsukui_mouse_seurat_ut,cells.highlight = clus15_mgl2_gpr183)+
+  theme(legend.position = "none")+
+  labs(title = "Mgl2+Gpr183+ cells in cluster 15")
+
+# dev.off()
+```
+
+### define adventitial fibroblasts using Pi16+Col1a1+
+
+```{r plot figures for ms3}
+# pdf(file = paste0(working.dir,"MS_figures/Fig_JYu_6.1_to_define_adventitial_cells.pdf"))
+FeaturePlot(tsukui_mouse_seurat_ut,features = c("Pi16"),
+            label = FALSE,
+            slot = "data",
+            cols = c("grey","red"))
+
+FeaturePlot(tsukui_mouse_seurat_ut,features = c("Col1a1"),
+            label = FALSE,
+            slot = "data",
+            cols = c("grey","red"))
+
+FeaturePlot(tsukui_mouse_seurat_ut,features = c("Pdgfra"),
+            label = FALSE,
+            slot = "data",
+            cols = c("grey","red"))
+# dev.off()
+```
+
+## overview UMAP for GFPp_Col1a1p_cells
+
+```{r plot figures for ms4}
+# pdf(file = paste0(working.dir,"MS_figures/Fig_JYu_5_UMAP_cluster_overview_for_GFPp_Col1a1p_cells.pdf"))
+DimPlot(tsukui_mouse_GFPp_col1a1_seurat_ut,label = TRUE,cols = c(rep("grey",3),c("violet","royalblue","darkgreen"),rep("grey",4)))
+# dev.off()
+```
